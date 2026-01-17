@@ -8,6 +8,12 @@ IMPORTANT LIMITATIONS:
 - Gmail, Outlook, Yahoo, and other major providers may return false positives
   (they may accept addresses that don't exist to prevent enumeration)
 - Results indicate mail server acceptance, NOT actual account existence
+
+AWS EC2 PORT 25 RESTRICTION:
+- AWS EC2 blocks outbound port 25 connections by default to prevent spam
+- This will cause SMTP verification to fail for most emails
+- To fix: Request AWS to remove port 25 restriction via support case
+- Alternative: Use port 587/465, but most servers require authentication
 """
 
 import re
@@ -79,66 +85,106 @@ def smtp_handshake(mx_host: str, email: str, timeout: int = SMTP_TIMEOUT) -> Tup
     """
     Perform SMTP handshake using RCPT TO command.
     Does NOT send any email (no DATA command).
+    Tries multiple MX hosts and ports.
     Returns (accepted, error_message)
     """
-    server = None
-    try:
-        # Connect to SMTP server
-        server = smtplib.SMTP(timeout=timeout)
-        server.set_debuglevel(0)
-        server.connect(mx_host, SMTP_PORT)
-        
-        # Send EHLO/HELO
+    # Try multiple ports (25, 587, 465)
+    ports_to_try = [SMTP_PORT, SMTP_ESMTP_PORT, 465]
+    
+    last_error = None
+    
+    for port in ports_to_try:
+        server = None
         try:
-            server.ehlo()
-        except Exception:
-            server.helo()
-        
-        # Some servers require MAIL FROM first
-        server.mail('')
-        
-        # Try RCPT TO - this checks if the mailbox is accepted
-        code, message = server.rcpt(email)
-        
-        # 250 = success, 251/252 = success (forwarding or catch-all)
-        if code in (250, 251, 252):
-            server.quit()
-            return True, "Accepted"
-        else:
-            server.quit()
-            msg = message.decode('utf-8', errors='ignore') if isinstance(message, bytes) else str(message)
-            return False, f"Rejected: {code} {msg}"
+            # Connect to SMTP server
+            server = smtplib.SMTP(timeout=SMTP_CONNECT_TIMEOUT)
+            server.set_debuglevel(0)
+            server.connect(mx_host, port, timeout=SMTP_CONNECT_TIMEOUT)
             
-    except (socket.timeout, smtplib.socket.timeout, TimeoutError):
-        if server:
+            # Send EHLO/HELO
             try:
-                server.quit()
-            except:
-                pass
-        return False, "Connection timeout"
-    except socket.gaierror:
-        if server:
+                server.ehlo()
+            except Exception:
+                try:
+                    server.helo()
+                except Exception:
+                    server.quit()
+                    continue
+            
+            # Some servers require MAIL FROM first
             try:
+                server.mail('')
+            except Exception as e:
                 server.quit()
-            except:
-                pass
-        return False, "Could not resolve host"
-    except (ConnectionRefusedError, OSError) as e:
-        if server:
+                last_error = f"MAIL FROM failed: {str(e)}"
+                continue
+            
+            # Try RCPT TO - this checks if the mailbox is accepted
             try:
+                code, message = server.rcpt(email)
+                
+                # 250 = success, 251/252 = success (forwarding or catch-all)
+                if code in (250, 251, 252):
+                    server.quit()
+                    return True, "Accepted"
+                else:
+                    server.quit()
+                    msg = message.decode('utf-8', errors='ignore') if isinstance(message, bytes) else str(message)
+                    last_error = f"Rejected: {code} {msg}"
+                    # Continue to next port if this one rejected
+                    continue
+            except smtplib.SMTPRecipientsRefused as e:
                 server.quit()
-            except:
-                pass
-        return False, f"Connection error: {str(e)}"
-    except smtplib.SMTPServerDisconnected:
-        return False, "Server disconnected"
-    except Exception as e:
-        if server:
-            try:
+                last_error = f"Recipient refused: {str(e)}"
+                continue
+            except Exception as e:
                 server.quit()
-            except:
-                pass
-        return False, f"SMTP error: {str(e)}"
+                last_error = f"RCPT TO error: {str(e)}"
+                continue
+                
+        except (socket.timeout, smtplib.socket.timeout, TimeoutError):
+            if server:
+                try:
+                    server.quit()
+                except:
+                    pass
+            last_error = f"Connection timeout on port {port}"
+            continue
+        except socket.gaierror:
+            if server:
+                try:
+                    server.quit()
+                except:
+                    pass
+            last_error = "Could not resolve host"
+            break  # No point trying other ports if DNS fails
+        except (ConnectionRefusedError, OSError, ConnectionResetError) as e:
+            if server:
+                try:
+                    server.quit()
+                except:
+                    pass
+            error_str = str(e)
+            # Check if it's port 25 blocked (common on AWS EC2)
+            if port == 25 and ("Connection refused" in error_str or "errno 111" in error_str):
+                last_error = f"Port 25 blocked (AWS EC2 blocks outbound port 25 by default)"
+                continue  # Try next port
+            last_error = f"Connection error on port {port}: {str(e)}"
+            continue
+        except smtplib.SMTPServerDisconnected:
+            last_error = f"Server disconnected on port {port}"
+            continue
+        except Exception as e:
+            if server:
+                try:
+                    server.quit()
+                except:
+                    pass
+            last_error = f"SMTP error on port {port}: {str(e)}"
+            continue
+    
+    # If we get here, all ports failed
+    return False, last_error or "All connection attempts failed"
 
 
 def check_catch_all(domain: str, mx_hosts: list) -> bool:
@@ -194,8 +240,15 @@ def verify_email(email: str) -> Dict:
     # If no explicit MX records but domain exists, mx_hosts will contain the domain
     # This is already handled by check_dns_and_mx
     
-    # Step 3: SMTP handshake
-    accepted, error_msg = smtp_handshake(mx_hosts[0], email)
+    # Step 3: SMTP handshake - try multiple MX hosts
+    accepted = False
+    error_msg = "No MX hosts available"
+    
+    for mx_host in mx_hosts[:3]:  # Try first 3 MX hosts
+        accepted, error_msg = smtp_handshake(mx_host, email)
+        if accepted:
+            break
+    
     result['smtp_accepts'] = accepted
     
     if not accepted:
